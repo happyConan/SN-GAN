@@ -7,13 +7,14 @@ import torchvision.utils as vutils
 from torch.autograd import Variable
 import torch.utils.data
 import torch.backends.cudnn as cudnn
+import os
 
 import random
 import argparse
 from models.models import _netG, _netD
 
 parser = argparse.ArgumentParser(description='train SNDCGAN model')
-parser.add_argument('--cuda', action='store_true', help='enables cuda')
+parser.add_argument('--cuda',default=True, action='store_true', help='enables cuda')
 parser.add_argument('--gpu_ids', default=[0,1,2,3], help='gpu ids: e.g. 0,1,2, 0,2.')
 parser.add_argument('--manualSeed', type=int, help='manual seed')
 parser.add_argument('--n_dis', type=int, default=1, help='discriminator critic iters')
@@ -32,7 +33,7 @@ print(opt)
 #                            ])
 #                                       )
 
-dataset = datasets.CIFAR10(root='dataset', download=True,
+dataset = datasets.CIFAR10(root='dataset', download=False,
                            transform=transforms.Compose([
                                transforms.Scale(32),
                                transforms.ToTensor(),
@@ -48,9 +49,9 @@ print("Random Seed: ", opt.manualSeed)
 random.seed(opt.manualSeed)
 torch.manual_seed(opt.manualSeed)
 
-if opt.cuda:
-    torch.cuda.manual_seed_all(opt.manualSeed)
-    torch.cuda.set_device(opt.gpu_ids[0])
+# if opt.cuda:
+#     torch.cuda.manual_seed_all(opt.manualSeed)
+#     torch.cuda.set_device(opt.gpu_ids[0])
 
 cudnn.benchmark = True
 
@@ -72,6 +73,32 @@ print(SND)
 G.apply(weight_filler)
 SND.apply(weight_filler)
 
+if os.path.isfile("log/netD_epoch.pth"):
+    # original saved file with DataParallel
+    state_dict = torch.load("log/netD_epoch.pth")
+    # create new OrderedDict that does not contain `module.`
+    from collections import OrderedDict
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        name = k[7:]  # remove `module.`
+        new_state_dict[name] = v
+    # load params
+    SND.load_state_dict(new_state_dict)
+
+if os.path.isfile("log/netG_epoch.pth"):
+    # original saved file with DataParallel
+    state_dict = torch.load("log/netG_epoch.pth")
+    # create new OrderedDict that does not contain `module.`
+    from collections import OrderedDict
+    new_state_dict = OrderedDict()
+    for k, v in state_dict.items():
+        name = k[7:]  # remove `module.`
+        new_state_dict[name] = v
+    # load params
+    G.load_state_dict(new_state_dict)
+
+
+
 input = torch.FloatTensor(opt.batchsize, 3, 32, 32)
 noise = torch.FloatTensor(opt.batchsize, nz, 1, 1)
 fixed_noise = torch.FloatTensor(opt.batchsize, nz, 1, 1).normal_(0, 1)
@@ -83,14 +110,19 @@ fixed_noise = Variable(fixed_noise)
 criterion = nn.BCELoss()
 
 if opt.cuda:
-    G.cuda()
-    SND.cuda()
+    G=G.cuda(opt.gpu_ids[0])
+    G=nn.DataParallel(G,device_ids=opt.gpu_ids)
+    SND=SND.cuda(opt.gpu_ids[0])
+    SND=nn.DataParallel(SND,device_ids=opt.gpu_ids)
     criterion.cuda()
     input, label = input.cuda(), label.cuda()
     noise, fixed_noise = noise.cuda(), fixed_noise.cuda()
 
 optimizerG = optim.Adam(G.parameters(), lr=0.0002, betas=(0, 0.9))
 optimizerSND = optim.Adam(SND.parameters(), lr=0.0002, betas=(0, 0.9))
+
+optimizerG=nn.DataParallel(optimizerG,device_ids=opt.gpu_ids)
+optimizerSND=nn.DataParallel(optimizerSND,device_ids=opt.gpu_ids)
 
 for epoch in range(200):
     for i, data in enumerate(dataloader, 0):
@@ -127,7 +159,7 @@ for epoch in range(200):
         D_G_z1 = output.data.mean()
         errD = errD_real + errD_fake
 
-        optimizerSND.step()
+        optimizerSND.module.step()
         ############################
         # (2) Update G network: maximize log(D(G(z)))
         ###########################
@@ -139,11 +171,11 @@ for epoch in range(200):
             errG = criterion(output, labelv)
             errG.backward()
             D_G_z2 = output.data.mean()
-            optimizerG.step()
+            optimizerG.module.step()
         if i % 20 == 0:
             print('[%d/%d][%d/%d] Loss_D: %.4f Loss_G: %.4f D(x): %.4f D(G(z)): %.4f / %.4f'
                   % (epoch, 200, i, len(dataloader),
-                     errD.data[0], errG.data[0], D_x, D_G_z1, D_G_z2))
+                     errD.item(), errG.item(), D_x, D_G_z1, D_G_z2))
         if i % 100 == 0:
             vutils.save_image(real_cpu,
                     '%s/real_samples.png' % 'log',
@@ -154,8 +186,8 @@ for epoch in range(200):
                     normalize=True)
 
     # do checkpointing
-torch.save(G.state_dict(), '%s/netG_epoch_%d.pth' % ('log', epoch))
-torch.save(SND.state_dict(), '%s/netD_epoch_%d.pth' % ('log', epoch))
+    torch.save(G.state_dict(), '%s/netG_epoch.pth' % ('log'))
+    torch.save(SND.state_dict(), '%s/netD_epoch.pth' % ('log'))
 
 
 
